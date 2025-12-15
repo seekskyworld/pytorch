@@ -20,7 +20,7 @@ import torch
 import torch._logging
 from torch._inductor import metrics
 from torch._inductor.ir import MultiTemplateBuffer
-from torch._inductor.tiling_utils import analyze_memory_coalescing
+from torch._inductor.tiling_utils import analyze_memory_coalescing, loop_tiling_log
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.fx.immutable_collections import immutable_dict
 from torch.utils._ordered_set import OrderedSet
@@ -1864,7 +1864,10 @@ class SIMDScheduling(BaseScheduling):
         kernels = self.create_kernel_choices(
             kernel_features,
             [tiling],
-            {"features": kernel_features, "tiling_scores": tiling_score},
+            {
+                "features": kernel_features,
+                "tiling_scores": tiling_score,
+            },
         )
         for kernel in kernels:
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
@@ -2659,6 +2662,29 @@ class SIMDScheduling(BaseScheduling):
         """
         Generates a tiling, and a score of each tile according to each tile's coalesced memory accesses.
         """
+        # For indirect indexing patterns (e.g., embedding), swap loop order to place
+        # the index-dependent dimension on program_id(0) for better SM scheduling.
+        norm_rw = coalesce_analysis.norm_read_writes
+        indirect_broadcast_vars = norm_rw.indirect_broadcast_vars
+        if indirect_broadcast_vars and len(norm_rw.index_vars) == 2:
+            broadcast_coalesced_score = sum(
+                coalesce_analysis.coalesced_by_var.get(v, 0)
+                for v in indirect_broadcast_vars
+            )
+            if broadcast_coalesced_score > 0:
+                loop_tiling_log.info(
+                    "Applying loop reorder for indirect indexing "
+                    "(indirect_broadcast_vars=%s, score=%s)",
+                    indirect_broadcast_vars,
+                    broadcast_coalesced_score,
+                )
+                for snode in node_schedule:
+                    if isinstance(snode, scheduler.SchedulerNode):
+                        # Only swap if node has exactly 2 pointwise dimensions
+                        pw_ranges, _ = snode.get_ranges()
+                        if len(pw_ranges) == 2:
+                            snode.apply_new_loop_order([1, 0])
+
         tiling_var: Optional[sympy.Expr] = (
             None
             if not coalesce_analysis.suggested_split

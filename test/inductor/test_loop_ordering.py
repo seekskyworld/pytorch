@@ -1222,6 +1222,107 @@ class TestTiling(TestCase):
         result = tiling_utils.find_broadcast_var(i + j * 10, {i: 10, j: 8, k: 20})
         self.assertEqual(result, None)
 
+    def test_embedding_indirect_tiling(self):
+        """Test that embedding operations get proper loop ordering for coalesced access.
+
+        For embedding patterns like weights[indices[i], j], the index load only depends
+        on variable i, while the weight read is coalesced on variable j. This test
+        verifies that we detect this pattern and reorder loops so that:
+        - The index-dependent dimension (i) is placed on program_id(0) for better SM scheduling
+        - The coalesced dimension (j) uses the fast-moving index within the block
+        """
+        B, S, V, D = 8, 512, 1024, 256
+
+        indices = torch.randint(0, V, (B, S), device=GPU_TYPE)
+        weights = torch.randn(V, D, device=GPU_TYPE)
+
+        def embedding(idx, w):
+            return torch.nn.functional.embedding(idx, w)
+
+        out, code = run_and_get_code(torch.compile(embedding), indices, weights)
+
+        # Check correctness
+        expected = embedding(indices, weights)
+        self.assertEqual(out, expected)
+
+        # The kernel should be 2D tiled (have both XBLOCK and YBLOCK)
+        FileCheck().check("YBLOCK").check("XBLOCK").run(code[0])
+
+        # The index load should use the x dimension (from program_id(0))
+        # and the weight load should be coalesced on y
+        # This pattern shows the loop reordering is working:
+        # - in_ptr0 (indices) loaded via x index
+        # - in_ptr1 (weights) loaded with y in the stride-1 position
+        FileCheck().check("in_ptr0").check("in_ptr1").run(code[0])
+
+    def test_indirect_access_not_coalesced(self):
+        """Test that memory accesses with indirect indexing are treated as uncoalesced.
+
+        When we have an access pattern like weights[indices[i]], the weight load
+        uses an indirect index and should NOT be counted as coalesced since the
+        access pattern is effectively random.
+
+        For w[idx] where idx is (4096,) and w is (1024, 256):
+        - Read of idx: coalesced (simple linear access)
+        - Read of w: uncoalesced (uses indirect index)
+        - Write to output: coalesced (contiguous)
+        """
+        from torch._inductor import tiling_utils
+        from torch.utils._sympy.symbol import symbol_is_type, SymT
+
+        def fn(nodes):
+            self.assertTrue(len(nodes) == 1)
+
+            coalesce_analysis = tiling_utils.analyze_memory_coalescing(nodes[0])
+            self.assertIsNotNone(coalesce_analysis)
+
+            # Should have exactly 1 uncoalesced access (the indirect weight read)
+            self.assertEqual(
+                len(coalesce_analysis.uncoalesced_addrs),
+                1,
+                f"Expected 1 uncoalesced access, got {len(coalesce_analysis.uncoalesced_addrs)}",
+            )
+
+            # The uncoalesced access should have an INDIRECT symbol
+            for expr in coalesce_analysis.uncoalesced_addrs:
+                has_indirect = any(
+                    symbol_is_type(s, SymT.INDIRECT) for s in expr.free_symbols
+                )
+                self.assertTrue(
+                    has_indirect,
+                    f"Expected uncoalesced expr {expr} to have INDIRECT symbol",
+                )
+
+            # Should have coalesced accesses (idx read + output write)
+            self.assertGreater(
+                len(coalesce_analysis.coalesced_by_var),
+                0,
+                "Expected at least one coalesced variable",
+            )
+
+            # Verify no INDIRECT symbols ended up as coalesced vars
+            for var in coalesce_analysis.coalesced_by_var:
+                self.assertFalse(
+                    symbol_is_type(var, SymT.INDIRECT),
+                    f"INDIRECT symbol {var} should not be in coalesced_by_var",
+                )
+
+            return nodes
+
+        V, D = 1024, 256
+        indices = torch.randint(0, V, (4096,), device=GPU_TYPE)
+        weights = torch.randn(V, D, device=GPU_TYPE)
+
+        def embedding_1d(idx, w):
+            return w[idx]
+
+        with torch._inductor.config.patch(_post_fusion_custom_pass=fn):
+            out = torch.compile(embedding_1d)(indices, weights)
+
+        # Verify correctness
+        expected = embedding_1d(indices, weights)
+        self.assertEqual(out, expected)
+
 
 class TestIndexInversion(TestCase):
     @classmethod
