@@ -39,7 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, NewType, Optional
-from weakref import WeakKeyDictionary
+from weakref import ref, WeakKeyDictionary
 
 import torch
 
@@ -84,12 +84,23 @@ class _OpaqueTypeInfo:
         [Any], list[Any]
     ]  # Callable that takes the object and returns list of values to guard on
     members: dict[str, MemberType]  # Maps member name to how it should be handled
+    type_ref: ref[Any]  # Weak reference to the class
 
 
 # Mapping of type -> (string name, reference/value type)
 _OPAQUE_TYPES: WeakKeyDictionary[Any, _OpaqueTypeInfo] = WeakKeyDictionary()
 # Mapping of class_name -> (type, reference/value type)
 _OPAQUE_TYPES_BY_NAME: dict[str, _OpaqueTypeInfo] = {}
+
+
+def _make_cleanup_callback(type_name: str) -> Callable[["ref[Any]"], None]:
+    """Create a cleanup callback for when an opaque type class is garbage collected."""
+
+    def cleanup(weak_ref: "ref[Any]") -> None:
+        _OPAQUE_TYPES_BY_NAME.pop(type_name, None)
+        torch._C._unregister_opaque_type(type_name)
+
+    return cleanup
 
 
 def get_opaque_type_name(cls: Any) -> str:
@@ -212,7 +223,9 @@ def register_opaque_type(
     # Generate a fully qualified name by combining module and qualname
     name = f"{cls.__module__}.{cls.__qualname__}"
 
-    type_info = _OpaqueTypeInfo(name, typ, guard_fn, members or {})
+    # Make sure we can cleanup the class correctly
+    type_ref = ref(cls, _make_cleanup_callback(name))
+    type_info = _OpaqueTypeInfo(name, typ, guard_fn, members or {}, type_ref)
     _OPAQUE_TYPES[cls] = type_info
     _OPAQUE_TYPES_BY_NAME[name] = type_info
 

@@ -1380,6 +1380,9 @@ def forward(self, arg0_1):
         for opaque_info in _OPAQUE_TYPES.values():
             self.assertFalse(tmp_class_name in opaque_info.class_name)
 
+        # This should not error
+        tmp_class_name = register_tmp_class()
+
     def test_value_type_nested(self):
         def foo(x, config):
             size = SizeStore(x.shape[0])
