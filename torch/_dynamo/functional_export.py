@@ -16,9 +16,14 @@ from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import CaptureOutput, fullgraph_capture, get_traced_fn
 from torch._dynamo.eval_frame import argument_names, check_user_input_output
 from torch._dynamo.exc import UserErrorType
-from torch._dynamo.utils import dynamo_timed, get_metrics_context, set_torch_function_mode_stack
+from torch._dynamo.utils import (
+    dynamo_timed,
+    get_metrics_context,
+    set_torch_function_mode_stack,
+)
 from torch._export.utils import _compiling_state_context
 from torch._guards import TracingContext
+from torch.export import _restore_state_dict
 from torch.export.dynamic_shapes import _RelaxedConstraint, Constraint
 from torch.fx import Node
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -641,6 +646,7 @@ def normalize_graph_module(gm: torch.fx.GraphModule) -> None:
 def dynamo_graph_capture_for_export(
     mod: Callable[..., Any],
     constraints: Optional[list[Constraint]] = None,
+    restore_state_dict: bool = False,
 ) -> Callable[..., Any]:
     def inner(*args: Any, **kwargs: Any) -> Any:
         assert not torch._dynamo.config.install_free_tensors
@@ -711,6 +717,8 @@ def dynamo_graph_capture_for_export(
         tracing_context = TracingContext(graph_module.meta["fake_mode"])
         tracing_context.tensor_to_context = out.backend_input.tensor_to_context  # type: ignore[attr-defined]
         graph_module.meta["tracing_context"] = tracing_context
+        if restore_state_dict:
+            _restore_state_dict(mod, graph_module)
         return graph_module
 
     return inner
