@@ -1048,6 +1048,9 @@ class PallasKernel(SIMDKernel):
                 # Strided multi-dimensional access (e.g., permute/transpose views).
                 # JAX arrays don't preserve PyTorch strides, so we must generate
                 # explicit strided indexing to honor the view.
+                # On GPU, iteration variables aren't generated, so use [...] instead.
+                if self.is_gpu:
+                    return "..."
                 return self._generate_strided_index(index)
 
         # For complex cases, use [...] since inputs are made contiguous
@@ -1649,6 +1652,9 @@ class PallasKernel(SIMDKernel):
             and len(used_vars) > 0
             and not has_symbolic_coef
         ):
+            # On GPU, iteration variables aren't generated, so use [...] instead
+            if self.is_gpu:
+                return "...", False
             return self._generate_strided_index(index), True
 
         return index_str, needs_flatten
@@ -1683,11 +1689,15 @@ class PallasKernel(SIMDKernel):
                 return index_str, True  # Use flattened access
             elif "::" in index_str:
                 # Strided slice patterns need flattened indexing for multi-dim
+                # On GPU, iteration variables aren't generated, so use [...] instead
+                if self.is_gpu:
+                    return "...", False
                 return self._generate_strided_index(index), True
 
         # GPU doesn't support gather from slice patterns on 1D buffers
         if self.is_gpu and "::" in index_str:
-            return self._generate_strided_index(index), True
+            # On GPU, use [...] for full array access instead of strided indexing
+            return "...", False
 
         return index_str, needs_flatten
 
@@ -4034,7 +4044,7 @@ def _pallas_add(x, y):
                 code.writeline("        _padded_inputs = []")
                 for i, param in enumerate(kernel_input_params):
                     code.writeline(
-                        f"        _broadcasted_{i} = jnp.broadcast_to({param}, _target_shape).flatten()"
+                        f"        _broadcasted_{i} = _pallas_broadcast_to({param}, _target_shape).flatten()"
                     )
                     code.writeline(
                         f"        _aligned_size_{i} = ((_target_numel + 127) // 128) * 128"
@@ -4158,9 +4168,12 @@ def _pallas_add(x, y):
             for ptr in pointer_tail:
                 if ptr.startswith("in_ptr"):
                     buf_name = input_param_to_buf.get(ptr)
+                    # Only use base storage for CPU with strided indexing.
+                    # For GPU, we skip this and rely on .contiguous() + transpose in kernel.
                     use_base = (
                         buf_name is not None
                         and not self._buffer_is_contiguous(buf_name)
+                        and interpret_is_cpu  # GPU: skip flat storage, use contiguous instead
                     )
                     if use_base:
                         # Use base storage in physical order and slice to the view's
