@@ -1232,7 +1232,7 @@ def handle_log_file(
 def get_pytest_args(options, is_cpp_test=False, is_distributed_test=False):
     if is_distributed_test:
         # Distributed tests do not support rerun, see https://github.com/pytorch/pytorch/issues/162978
-        rerun_options = ["-x", "--reruns=0"]
+        rerun_options = ["--reruns=0"]
     elif RERUN_DISABLED_TESTS:
         # ASAN tests are too slow, so running them x50 will cause the jobs to timeout after
         # 3+ hours. So, let's opt for less number of reruns. We need at least 150 instances of the
@@ -1242,9 +1242,8 @@ def get_pytest_args(options, is_cpp_test=False, is_distributed_test=False):
         # flakiness status. Default to 50 re-runs
         rerun_options = ["--flake-finder", f"--flake-runs={count}"]
     else:
-        # When under the normal mode, retry a failed test 2 more times. -x means stop at the first
-        # failure
-        rerun_options = ["-x", "--reruns=2"]
+        # When under the normal mode, retry a failed test 2 more times
+        rerun_options = ["--reruns=2"]
 
     pytest_args = [
         "-vv",
