@@ -44,6 +44,42 @@ from torch.testing._internal.common_utils import (
 )
 
 
+class Color:
+    """Simulates a pybind11-style enum where class attributes are instances of the class."""
+
+    def __init__(self, name: str, value: int) -> None:
+        self._name = name
+        self._value = value
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"Color.{self._name}"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Color):
+            return self._value == other._value
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+    def __float__(self) -> float:
+        return float(self._value)
+
+
+Color.RED = Color("RED", 1)
+Color.GREEN = Color("GREEN", 2)
+Color.BLUE = Color("BLUE", 3)
+Color.DEFAULT_SCALE = 1.5  # Literal class attribute for testing inlining
+
+
 class OpaqueQueue:
     def __init__(self, queue: list[torch.Tensor], init_tensor_: torch.Tensor) -> None:
         super().__init__()
@@ -247,6 +283,7 @@ register_opaque_type(
 )
 register_opaque_type(NestedValueSize, typ="value")
 register_opaque_type(OpaqueMultiplier, typ="reference")
+register_opaque_type(Color, typ="reference")
 
 
 # A tensor subclass (similar to TwoTensor) that also holds an opaque Counter
@@ -510,6 +547,28 @@ class TestOpaqueObject(TestCase):
             return torch.empty_like(x)
 
         opaque_multiplier_type = get_opaque_type_name(OpaqueMultiplier)
+        color_type = get_opaque_type_name(Color)
+
+        torch.library.define(
+            "_TestOpaqueObject::apply_color_scale",
+            f"({color_type} color, Tensor x) -> Tensor",
+            tags=torch.Tag.pt2_compliant_tag,
+            lib=self.lib,
+        )
+
+        @torch.library.impl(
+            "_TestOpaqueObject::apply_color_scale",
+            "CompositeExplicitAutograd",
+            lib=self.lib,
+        )
+        def apply_color_scale_impl(color: Color, x: torch.Tensor) -> torch.Tensor:
+            return x * float(color)
+
+        @torch.library.register_fake(
+            "_TestOpaqueObject::apply_color_scale", lib=self.lib
+        )
+        def apply_color_scale_fake(color: Color, x: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
 
         torch.library.define(
             "_TestOpaqueObject::mul_with_scale",
@@ -1614,6 +1673,88 @@ def forward(self, primals_2, tangents_1):
                 torch._dynamo.reset()
                 grad2 = run_with_multiplier(3.0)
                 self.assertFalse(torch.allclose(grad1, grad2))
+
+    def test_subgraph_tracer_create_arg_with_fake_script_object(self):
+        """Test that opaque class attribute access works correctly.
+
+        This tests the code path where:
+        1. An opaque class (like Color) is accessed via OpaqueObjectClassVariable
+        2. Attribute access (Color.RED) goes through var_getattr with static getattr
+        3. The opaque object is correctly lifted as a graph input
+        """
+        from torch._library.opaque_object import is_opaque_reference_type
+
+        self.assertTrue(is_opaque_reference_type(Color))
+        self.assertTrue(is_opaque_reference_type(type(Color.RED)))
+
+        captured = {"graph": None, "example_inputs": None}
+
+        def capture_backend(gm, example_inputs):
+            captured["graph"] = gm
+            captured["example_inputs"] = example_inputs
+            return gm
+
+        @torch.compile(fullgraph=True, backend=capture_backend)
+        def fn(x):
+            return torch.ops._TestOpaqueObject.apply_color_scale(Color.GREEN, x)
+
+        x = torch.randn(3, 3)
+        result = fn(x)
+
+        self.assertIsNotNone(captured["graph"])
+        print(captured["graph"].code.strip())
+
+        expected = x * float(Color.GREEN.value)
+        self.assertTrue(torch.allclose(result, expected))
+
+        def is_called_from_pytest():
+            import os
+
+            return "PYTEST_VERSION" in os.environ
+
+        graph_code = captured["graph"].code.strip()
+        self.assertExpectedInline(
+            graph_code,
+            f"""\
+def forward(self, L_x_ : torch.Tensor, G_Color_GREEN : {"test_opaque_obj_v2" if is_called_from_pytest() else "__main__"}_Color):
+    l_x_ = L_x_
+    g_color_green = G_Color_GREEN
+    apply_color_scale = torch.ops._TestOpaqueObject.apply_color_scale(g_color_green, l_x_);  g_color_green = l_x_ = None
+    return (apply_color_scale,)""",  # noqa: B950
+        )
+
+    def test_opaque_class_literal_attribute_inlined(self):
+        """Test that literal attributes on opaque classes are inlined without source tracking.
+
+        When accessing a literal class attribute (like Color.DEFAULT_SCALE = 1.5),
+        the value should be constant-folded directly without creating a graph input.
+        """
+        captured = {"graph": None}
+
+        def capture_backend(gm, example_inputs):
+            captured["graph"] = gm
+            return gm
+
+        @torch.compile(fullgraph=True, backend=capture_backend)
+        def fn(x):
+            return x * Color.DEFAULT_SCALE
+
+        x = torch.randn(3, 3)
+        result = fn(x)
+
+        expected = x * 1.5
+        self.assertTrue(torch.allclose(result, expected))
+
+        self.assertIsNotNone(captured["graph"])
+        graph_code = captured["graph"].code.strip()
+        self.assertExpectedInline(
+            graph_code,
+            """\
+def forward(self, L_x_ : torch.Tensor):
+    l_x_ = L_x_
+    mul = l_x_ * 1.5;  l_x_ = None
+    return (mul,)""",
+        )
 
 
 instantiate_parametrized_tests(TestOpaqueObject)
